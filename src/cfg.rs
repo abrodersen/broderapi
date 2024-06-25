@@ -2,6 +2,7 @@ use std::env;
 
 use eyre::{Context, Result};
 
+#[derive(Clone)]
 pub struct Config {
     pub matrix_user_id:  String,
     pub matrix_password: String,

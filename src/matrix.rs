@@ -12,12 +12,6 @@ pub async fn init_matrix_client(settings: &Config) -> Result<Client> {
         .await
         .wrap_err("failed to initialize matrix client")?;
 
-    println!("authenticating with username = {}", user_id);
-    client.matrix_auth()
-        .login_username(user_id, &settings.matrix_password)
-        .await
-        .wrap_err("failed to authenticate with matrix homeserver")?;
-
     // println!("running preliminary sync");
     // client.sync_once(SyncSettings::default())
     //     .await

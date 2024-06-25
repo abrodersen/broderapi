@@ -1,31 +1,22 @@
 mod cfg;
 mod matrix;
 
-use std::{future::IntoFuture, sync::Arc};
+use std::sync::Arc;
 
 use axum::{debug_handler, extract::State, http::StatusCode, routing::{get, post}, Form};
+use cfg::Config;
 use eyre::{Context, Result};
-use matrix_sdk::{config::SyncSettings, ruma::{events::room::message::RoomMessageEventContent, RoomAliasId}, Client as MatrixClient};
+use matrix_sdk::{config::SyncSettings, ruma::{events::room::message::RoomMessageEventContent, RoomAliasId, UserId}, Client as MatrixClient};
 use serde::Deserialize;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = cfg::Config::create()?;
     let client = matrix::init_matrix_client(&config).await?;
-    let state = Arc::new(AppState { client: client, room: config.matrix_room_id });
-    let app = axum::Router::new()
-        .route("/health/startup", get(get_startup))
-        .route("/health/liveness", get(get_liveness))
-        .route("/health/readiness", get(get_readiness))
-        .route("/twilio/messages", post(post_twilio_message))
-        .with_state(state.clone());
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9090")
-        .await
-        .wrap_err("failed to start tokio listener")?;
-
-    let server = axum::serve(listener, app).into_future();
-    let (_, _) = tokio::join!(sync(&state), server);
+    let state = Arc::new(AppState { client: client, cfg: config });
+    if let Err(e) = tokio::try_join!(sync(&state), run_server(state.clone())) {
+        println!("abnormal termination: {}", e);
+    }
 
     Ok(())
 }
@@ -33,7 +24,7 @@ async fn main() -> Result<()> {
 #[derive(Clone)]
 struct AppState {
     client: MatrixClient,
-    room: String,
+    cfg: Config,
 }
 
 #[derive(Deserialize)]
@@ -47,8 +38,35 @@ struct TwilioNewMessage {
 }
 
 async fn sync(state: &AppState) -> Result<()> {
+    let user_id = UserId::parse(&state.cfg.matrix_user_id)
+        .wrap_err("failed to parse matrix user id")?;
+    
+    println!("authenticating with username = {}", user_id);
+    state.client.matrix_auth()
+        .login_username(user_id, &state.cfg.matrix_password)
+        .await
+        .wrap_err("failed to authenticate with matrix homeserver")?;
+
+    print!("running continuous sync");
     state.client.sync(SyncSettings::default()).await
         .wrap_err("failed to sync matrix client")
+}
+
+async fn run_server(state: Arc<AppState>) -> Result<()> {
+    let app = axum::Router::new()
+        .route("/health/startup", get(get_startup))
+        .route("/health/liveness", get(get_liveness))
+        .route("/health/readiness", get(get_readiness))
+        .route("/twilio/messages", post(post_twilio_message))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9090")
+        .await
+        .wrap_err("failed to start tokio listener")?;
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
 async fn get_startup(
@@ -77,9 +95,9 @@ async fn post_twilio_message(
     State(state): State<Arc<AppState>>,
     Form(data): Form<TwilioNewMessage>,
 ) -> Result<(), StatusCode> {
-    println!("new msg: from = {}, to = {}, body = {}, room = {}", data.from, data.to, data.body, &state.room);
+    println!("new msg: from = {}, to = {}, body = {}, room = {}", data.from, data.to, data.body, &state.cfg.matrix_room_id);
 
-    let room_alias = match RoomAliasId::parse(&state.room) {
+    let room_alias = match RoomAliasId::parse(&state.cfg.matrix_room_id) {
         Ok(r) => r,
         Err(e) => {
             println!("failed to parse room alias: {}", e);
