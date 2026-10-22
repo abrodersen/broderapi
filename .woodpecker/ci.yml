@@ -1,0 +1,92 @@
+# .woodpecker/ci.yml
+
+variables:
+  - &build_image 'docker.io/library/rust:1.97-slim'
+  - &ci_utils 'harbor.brodersen.family/internal/ci-utils:2026.09.20'
+  - &when_build
+    - event: pull_request
+      branch: feature/*
+    - event: push
+      branch: main
+  - &when_tag
+    - event: tag
+      ref: refs/tags/v*
+
+steps:
+  - name: cache-restore
+    image: *ci_utils
+    when: *when_build
+    failure: ignore
+    settings:
+      cache: &cache
+        action: restore
+        s3_endpoint: http://rook-ceph-rgw-objects.rook-ceph.svc:80
+        s3_bucket: woodpecker-cache-bkt-def77a2e-baf4-4fe4-881c-681932d3983e
+        object_prefix: build-cache/broderapi/cargo
+        base: /woodpecker
+        key_files:
+          - Cargo.lock
+        paths:
+          - .cargo/registry
+          - target
+        fallback_branch: main
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: woodpecker-cache-bucket
+
+  - name: test-and-build
+    image: *build_image
+    when: *when_build
+    depends_on: [cache-restore]
+    environment:
+      CARGO_HOME: /woodpecker/.cargo
+      CARGO_TARGET_DIR: /woodpecker/target
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - cargo test --release
+      - cargo build --release
+
+  - name: cache-save
+    image: *ci_utils
+    when: *when_build
+    failure: ignore
+    depends_on: [test-and-build]
+    settings:
+      cache:
+        <<: *cache
+        action: save
+        skip_if_exists: true
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: woodpecker-cache-bucket
+
+  - name: release
+    image: harbor.brodersen.family/internal/ci-utils:0.1.0
+    when:
+      event: push
+      branch: main
+    depends_on: [test-and-build]
+    settings:
+      github_token: { from_secret: github_token }
+      tag_source: calver
+      body: |
+        Automated release
+
+  - name: compute-version
+    image: docker.io/library/debian:13-slim
+    when: *when_tag
+    commands:
+      - echo "${CI_COMMIT_TAG#v}" > .tags
+
+  - name: publish-image
+    image: docker.io/woodpeckerci/plugin-docker-buildx:6.1.1
+    when: *when_tag
+    depends_on: [compute-version]
+    settings:
+      registry: https://harbor.brodersen.family
+      repo: harbor.brodersen.family/internal/broderapi
+      username: { from_secret: harbor_username }
+      password: { from_secret: harbor_password }
+      tags_file: .tags
